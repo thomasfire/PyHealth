@@ -21,9 +21,9 @@ LOAD_TABLE_COLUMNS = frozenset(
         "patient_id",
         "event_type",
         "timestamp",
-        "dsa_segments/segment_path",
-        "dsa_segments/activity_name",
-        "dsa_segments/activity_code",
+        "segments/segment_path",
+        "segments/activity_name",
+        "segments/activity_code",
     }
 )
 
@@ -57,13 +57,23 @@ def _write_segment(path: Path, n_rows: int = 125, n_cols: int = 45) -> None:
     path.write_text("\n".join([line] * n_rows) + "\n", encoding="utf-8")
 
 
-def _make_minimal_dsa_tree(root: Path) -> Path:
-    """Create minimal DSA directory structure with one segment."""
-    seg_dir = root / "a01" / "p1"
-    seg_dir.mkdir(parents=True, exist_ok=True)
-    seg_path = seg_dir / "s01.txt"
-    _write_segment(seg_path)
-    return seg_path
+def _make_minimal_dsa_tree(root: Path, activities=None, subjects=None, segments=None) -> Path:
+    """Create minimal DSA directory structure with configurable layout."""
+    activities = activities or ["a01"]
+    subjects = subjects or ["p1"]
+    segments = segments or ["s01.txt"]
+
+    first_seg = None
+    for activity in activities:
+        for subject in subjects:
+            for segment in segments:
+                seg_dir = root / activity / subject
+                seg_dir.mkdir(parents=True, exist_ok=True)
+                seg_path = seg_dir / segment
+                _write_segment(seg_path)
+                if first_seg is None:
+                    first_seg = seg_path
+    return first_seg
 
 
 class TestDSADataset(unittest.TestCase):
@@ -86,8 +96,18 @@ class TestDSADataset(unittest.TestCase):
         self.assertIsNotNone(self.dataset)
         self.assertEqual(self.dataset.dataset_name, "dsa")
         self.assertIsNotNone(self.dataset.config)
-        manifest = Path(self.root_path) / "dsa_manifest.csv"
+        manifest = Path(self.root_path) / "dsa-pyhealth.csv"
         self.assertTrue(manifest.is_file())
+
+    def test_config_attributes_loaded(self):
+        """Verify loader attributes (SleepEDF-style constants) are populated."""
+        ds = self.dataset
+        self.assertIsInstance(ds.label_mapping, dict)
+        self.assertIsInstance(ds.units, list)
+        self.assertIsInstance(ds.sensors, list)
+        self.assertEqual(ds.sampling_frequency, 25)
+        self.assertEqual(ds._num_columns, 45)
+        self.assertEqual(ds._num_rows, 125)
 
     def test_get_subject_ids(self):
         subject_ids = self.dataset.get_subject_ids()
@@ -143,7 +163,7 @@ class TestDSADataset(unittest.TestCase):
                 self.assertEqual(arr.shape[0], seg["num_samples"])
 
     def test_sensor_and_unit_channel_metadata(self):
-        """Sensors/units lists match YAML config."""
+        """Sensors/units lists match module metadata."""
         ds = self.dataset
 
         self.assertEqual(len(ds.units), len(EXPECTED_UNIT_KEYS_IN_ORDER))
@@ -156,7 +176,7 @@ class TestDSADataset(unittest.TestCase):
         self.assertEqual(tuple(sensor_keys), EXPECTED_SENSOR_KEYS_IN_ORDER)
 
     def test_manifest_csv_columns(self):
-        manifest = Path(self.root_path) / "dsa_manifest.csv"
+        manifest = Path(self.root_path) / "dsa-pyhealth.csv"
         df = pd.read_csv(manifest)
         self.assertEqual(list(df.columns), list(EXPECTED_MANIFEST_COLUMNS))
         self.assertEqual(len(df), 1)
@@ -167,15 +187,15 @@ class TestDSADataset(unittest.TestCase):
         self.assertEqual(row["segment_path"], "a01/p1/s01.txt")
 
     def test_load_table_manifest_via_base_dataset(self):
-        df = self.dataset.load_table("dsa_segments").compute()
+        df = self.dataset.load_table("segments").compute()
         self.assertEqual(frozenset(df.columns), LOAD_TABLE_COLUMNS)
         self.assertEqual(len(df), 1)
         row = df.iloc[0]
         self.assertEqual(row["patient_id"], "p1")
-        self.assertEqual(row["event_type"], "dsa_segments")
-        self.assertEqual(row["dsa_segments/activity_name"], "sitting")
-        self.assertEqual(row["dsa_segments/activity_code"], "A1")
-        self.assertEqual(row["dsa_segments/segment_path"], "a01/p1/s01.txt")
+        self.assertEqual(row["event_type"], "segments")
+        self.assertEqual(row["segments/activity_name"], "sitting")
+        self.assertEqual(row["segments/activity_code"], "A1")
+        self.assertEqual(row["segments/segment_path"], "a01/p1/s01.txt")
         self.assertTrue(pd.isna(row["timestamp"]))
 
     def test_segment_raises_on_wrong_row_count(self):
@@ -203,6 +223,68 @@ class TestDSADataset(unittest.TestCase):
             ds = DSADataset(root=tmpdir)
             with self.assertRaisesRegex(ValueError, "contains non-finite values"):
                 ds.get_subject_data("p1")
+
+    def test_multiple_subjects_and_activities(self):
+        """Manifest correctly scans multiple activities and subjects."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _make_minimal_dsa_tree(
+                Path(tmpdir),
+                activities=["a01", "a02"],
+                subjects=["p1", "p2"],
+                segments=["s01.txt", "s02.txt"],
+            )
+            ds = DSADataset(root=tmpdir)
+
+            subjects = ds.get_subject_ids()
+            self.assertEqual(sorted(subjects), ["p1", "p2"])
+
+            manifest = Path(tmpdir) / "dsa-pyhealth.csv"
+            df = pd.read_csv(manifest)
+            self.assertEqual(len(df), 8)  # 2 activities × 2 subjects × 2 segments
+
+            # Check activity names are mapped correctly
+            self.assertIn("sitting", df["activity_name"].values)
+            self.assertIn("standing", df["activity_name"].values)
+            self.assertIn("A1", df["activity_code"].values)
+            self.assertIn("A2", df["activity_code"].values)
+
+    def test_subject_not_found_raises(self):
+        """Requesting data for a non-existent subject raises ValueError."""
+        with self.assertRaisesRegex(ValueError, "Subject 'nonexistent' not found"):
+            self.dataset.get_subject_data("nonexistent")
+
+    def test_manifest_raises_on_empty_directory(self):
+        """Empty directory with no valid segments raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "No DSA segments under"):
+                DSADataset(root=tmpdir)
+
+    def test_segment_column_count_mismatch(self):
+        """Segment with wrong number of columns raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            seg_path = _make_minimal_dsa_tree(Path(tmpdir))
+            _write_segment(seg_path, n_rows=125, n_cols=44)
+            ds = DSADataset(root=tmpdir)
+            with self.assertRaisesRegex(ValueError, "has 44 columns, expected 45"):
+                ds.get_subject_data("p1")
+
+    def test_prepare_metadata_scans_standard_layout(self):
+        """prepare_metadata finds segments using the built-in layout rules."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "a03" / "p5").mkdir(parents=True)
+            _write_segment(root / "a03" / "p5" / "s10.txt")
+
+            manifest_path = root / "dsa-pyhealth.csv"
+            config_path = Path(__file__).parent.parent.parent / "pyhealth" / "datasets" / "configs" / "dsa.yaml"
+
+            DSADataset(root=str(root), config_path=str(config_path))
+            df = pd.read_csv(manifest_path)
+            self.assertEqual(len(df), 1)
+            row = df.iloc[0]
+            self.assertEqual(row["subject_id"], "p5")
+            self.assertEqual(row["activity_code"], "A3")
+            self.assertEqual(row["activity_name"], "lying_on_back")
 
 
 if __name__ == "__main__":

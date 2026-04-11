@@ -13,9 +13,76 @@ from pyhealth.datasets.base_dataset import BaseDataset
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Dataset metadata (SleepEDF-style: domain facts live in code, YAML is tables only)
+# -----------------------------------------------------------------------------
+
+DSA_PYHEALTH_MANIFEST = "dsa-pyhealth.csv"
+
+_LABEL_MAPPING: Dict[str, str] = {
+    "A1": "sitting",
+    "A2": "standing",
+    "A3": "lying_on_back",
+    "A4": "lying_on_right_side",
+    "A5": "ascending_stairs",
+    "A6": "descending_stairs",
+    "A7": "standing_in_elevator_still",
+    "A8": "moving_around_in_elevator",
+    "A9": "walking_in_parking_lot",
+    "A10": "walking_on_treadmill_flat",
+    "A11": "walking_on_treadmill_inclined",
+    "A12": "running_on_treadmill",
+    "A13": "exercising_on_stepper",
+    "A14": "exercising_on_cross_trainer",
+    "A15": "cycling_on_exercise_bike_horizontal",
+    "A16": "cycling_on_exercise_bike_vertical",
+    "A17": "rowing",
+    "A18": "jumping",
+    "A19": "playing_basketball",
+}
+
+_UNITS: List[Dict[str, str]] = [
+    {"T": "Torso"},
+    {"RA": "Right Arm"},
+    {"LA": "Left Arm"},
+    {"RL": "Right Leg"},
+    {"LL": "Left Leg"},
+]
+
+_SENSORS: List[Dict[str, str]] = [
+    {"xacc": "X-axis Accelerometer"},
+    {"yacc": "Y-axis Accelerometer"},
+    {"zacc": "Z-axis Accelerometer"},
+    {"xgyro": "X-axis Gyroscope"},
+    {"ygyro": "Y-axis Gyroscope"},
+    {"zgyro": "Z-axis Gyroscope"},
+    {"xmag": "X-axis Magnetometer"},
+    {"ymag": "Y-axis Magnetometer"},
+    {"zmag": "Z-axis Magnetometer"},
+]
+
+_SAMPLING_FREQUENCY = 25
+_NUM_COLUMNS = 45
+_NUM_ROWS = 125
+
+_LAYOUT = {
+    "activity_dir_pattern": r"^a\d{2}$",
+    "subject_dir_pattern": r"^p\d+$",
+    "segment_file_pattern": r"^s\d+\.txt$",
+    "code_regex_pattern": r"^A(\d+)$",
+    "file_extension": ".txt",
+}
+
+DSA_TABLE_NAME = "segments"
+
 
 class DSADataset(BaseDataset):
     """Daily and Sports Activities (DSA) time-series dataset (Barshan & Altun, 2010).
+
+    Structure mirrors :class:`SleepEDFDataset`: YAML lists only the manifest table;
+    labels, layout regexes, and channel metadata are defined in this module. If
+    ``dsa-pyhealth.csv`` is missing under ``root``, the tree is scanned and the
+    manifest is written before :class:`BaseDataset` is initialized.
 
     Recordings use five on-body IMU units (torso, two arms, two legs); each unit
     contributes nine columns per row (3-axis accelerometer, gyroscope, and
@@ -25,15 +92,7 @@ class DSADataset(BaseDataset):
 
     On disk, activities live in folders ``a01`` through ``a19``, subjects in ``p1``
     through ``p8``, and segment files ``s01.txt``, ``s02.txt``, … under each
-    subject. PyHealth maps ``aXX`` folder names to activity labels using the
-    ``label_mapping`` in ``configs/dsa.yaml``.
-
-    :class:`BaseDataset` reads a single tabular index of segments. The path to that
-    CSV (by default ``dsa_manifest.csv`` next to the activity folders) is set in the
-    YAML ``tables.dsa_segments.file_path`` entry. If that file is not present under
-    ``root`` when you construct this class, the loader walks the tree, matches the
-    same layout patterns as in the YAML, and writes the manifest. You can rebuild it
-    later with :meth:`prepare_metadata`.
+    subject.
 
     Dataset is available at:
     https://archive.ics.uci.edu/dataset/256/daily+and+sports+activities
@@ -44,8 +103,8 @@ class DSADataset(BaseDataset):
         https://doi.org/10.24432/C5C59F
 
     Args:
-        root: Dataset root (activity folders; manifest created if missing).
-        dataset_name: Defaults to ``internal_name`` from config or ``"dsa"``.
+        root str: Dataset root (activity folders; manifest created if missing).
+        dataset_name: Passed to :class:`BaseDataset`. Default ``"dsa"``.
         config_path: Path to ``dsa.yaml`` (default: package ``configs/dsa.yaml``).
         cache_dir: Cache directory for :class:`BaseDataset`.
         num_workers: Parallel workers for base pipelines.
@@ -61,7 +120,7 @@ class DSADataset(BaseDataset):
         self,
         root: str,
         dataset_name: Optional[str] = None,
-        config_path: Optional[Union[str, Path]] = None,
+        config_path: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         num_workers: int = 1,
         dev: bool = False,
@@ -72,15 +131,13 @@ class DSADataset(BaseDataset):
                 os.path.dirname(__file__), "configs", "dsa.yaml"
             )
 
-        metadata_filename = "dsa_manifest.csv"
-        metadata_path = os.path.join(root, metadata_filename)
-
+        metadata_path = os.path.join(root, DSA_PYHEALTH_MANIFEST)
         if not os.path.exists(metadata_path):
-            self.prepare_metadata(root, metadata_path, config_path)
+            self.prepare_metadata(root)
 
         super().__init__(
             root=root,
-            tables=["dsa_segments"],
+            tables=[DSA_TABLE_NAME],
             dataset_name=dataset_name or "dsa",
             config_path=config_path,
             cache_dir=cache_dir,
@@ -88,48 +145,33 @@ class DSADataset(BaseDataset):
             dev=dev,
         )
 
-        # Load config for dataset-specific attributes
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
+        self.label_mapping: Dict[str, str] = dict(_LABEL_MAPPING)
+        self.units: List[Dict[str, str]] = list(_UNITS)
+        self.sensors: List[Dict[str, str]] = list(_SENSORS)
+        self.sampling_frequency: int = _SAMPLING_FREQUENCY
+        self._num_columns: int = _NUM_COLUMNS
+        self._num_rows: int = _NUM_ROWS
 
-        task_cfg = (
-            config.get("dataset", {})
-            .get("task_configs", {})
-            .get("activity_recognition", {})
-        )
-        self.label_mapping: Dict[str, str] = dict(task_cfg.get("label_mapping", {}))
-        self.units: List[Dict[str, str]] = [
-            u for u in config.get("dataset", {}).get("units", []) if isinstance(u, dict)
-        ]
-        self.sensors: List[Dict[str, str]] = [
-            s for s in config.get("dataset", {}).get("sensors", []) if isinstance(s, dict)
-        ]
-        self.sampling_frequency: int = int(config.get("dataset", {}).get("sampling_frequency", 25))
-        ds_cfg = config.get("dataset", {}).get("data_structure", {})
-        self._num_columns: int = int(ds_cfg.get("num_columns", 45))
-        self._num_rows: int = int(ds_cfg.get("num_rows", 125))
+        layout = _LAYOUT
+        self._activity_dir_pattern = re.compile(layout["activity_dir_pattern"])
+        self._subject_dir_pattern = re.compile(layout["subject_dir_pattern"])
+        self._segment_file_pattern = re.compile(layout["segment_file_pattern"])
+        self._code_regex_pattern = layout["code_regex_pattern"]
+        self._file_extension = layout["file_extension"]
 
-    def prepare_metadata(
-        self, root: str, metadata_path: str, config_path: str
-    ) -> None:
-        """Scan ``root`` and overwrite the manifest CSV (``tables.dsa_segments``)."""
-        import yaml
+    def _manifest_path(self) -> str:
+        table_cfg = self.config.tables[DSA_TABLE_NAME]
+        return os.path.join(self.root, table_cfg.file_path)
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
+    def _get_label_mapping(self) -> Dict[str, str]:
+        return dict(self.label_mapping)
 
-        label_mapping = (
-            config.get("dataset", {})
-            .get("task_configs", {})
-            .get("activity_recognition", {})
-            .get("label_mapping", {})
-        )
-
-        layout = config.get("dataset", {}).get("layout", {})
-        a_re = re.compile(layout.get("activity_dir_pattern", r"^a\d{2}$"))
-        p_re = re.compile(layout.get("subject_dir_pattern", r"^p\d+$"))
-        s_re = re.compile(layout.get("segment_file_pattern", r"^s\d+\.txt$"))
+    def prepare_metadata(self, root: str) -> None:
+        """Scan ``root`` and write ``dsa-pyhealth.csv`` (``tables.segments``)."""
+        layout = _LAYOUT
+        a_re = re.compile(layout["activity_dir_pattern"])
+        p_re = re.compile(layout["subject_dir_pattern"])
+        s_re = re.compile(layout["segment_file_pattern"])
 
         rows = []
         for a_dir in sorted(os.listdir(root)):
@@ -154,7 +196,7 @@ class DSADataset(BaseDataset):
                     rows.append(
                         {
                             "subject_id": p_dir,
-                            "activity_name": label_mapping.get(activity_code, ""),
+                            "activity_name": _LABEL_MAPPING.get(activity_code, ""),
                             "activity_code": activity_code,
                             "segment_path": f"{a_dir}/{p_dir}/{s_file}",
                         }
@@ -165,28 +207,31 @@ class DSADataset(BaseDataset):
                 f"No DSA segments under {root}; expected aXX/pY/sZZ.txt layout."
             )
 
+        metadata_path = os.path.join(root, DSA_PYHEALTH_MANIFEST)
         df = pd.DataFrame(rows)
         df = df[["subject_id", "activity_name", "activity_code", "segment_path"]]
         df.to_csv(metadata_path, index=False)
 
     def get_subject_ids(self) -> List[str]:
         """Return sorted subject IDs from the manifest."""
-        manifest_path = os.path.join(self.root, "dsa_manifest.csv")
-        df = pd.read_csv(manifest_path)
+        df = pd.read_csv(self._manifest_path())
         return sorted(df["subject_id"].unique().tolist())
 
     def get_activity_labels(self) -> Dict[str, int]:
         """Map activity name to class index (ordered by activity code)."""
-        codes = sorted(
-            self.label_mapping.keys(),
-            key=lambda c: int(re.match(r"^A(\d+)$", c, re.IGNORECASE).group(1))
-        )
+        code_re = re.compile(self._code_regex_pattern)
+        def _code_order(code: str) -> int:
+            match = code_re.match(code)
+            if match is None:
+                raise ValueError(f"Invalid activity code {code!r}")
+            return int(match.group(1))
+
+        codes = sorted(self.label_mapping.keys(), key=_code_order)
         return {self.label_mapping[c]: i for i, c in enumerate(codes)}
 
     def get_subject_data(self, subject_id: str) -> Dict[str, Any]:
         """Load all segment arrays for one subject."""
-        manifest_path = os.path.join(self.root, "dsa_manifest.csv")
-        df = pd.read_csv(manifest_path)
+        df = pd.read_csv(self._manifest_path())
 
         subject_df = df[df["subject_id"] == subject_id]
         if subject_df.empty:

@@ -20,15 +20,15 @@ logger = logging.getLogger(__name__)
 DSA_PYHEALTH_MANIFEST = "dsa-pyhealth.csv"
 
 _LABEL_MAPPING: Dict[str, str] = {
-    "A1": "sitting",
-    "A2": "standing",
-    "A3": "lying_on_back",
-    "A4": "lying_on_right_side",
-    "A5": "ascending_stairs",
-    "A6": "descending_stairs",
-    "A7": "standing_in_elevator_still",
-    "A8": "moving_around_in_elevator",
-    "A9": "walking_in_parking_lot",
+    "A01": "sitting",
+    "A02": "standing",
+    "A03": "lying_on_back",
+    "A04": "lying_on_right_side",
+    "A05": "ascending_stairs",
+    "A06": "descending_stairs",
+    "A07": "standing_in_elevator_still",
+    "A08": "moving_around_in_elevator",
+    "A09": "walking_in_parking_lot",
     "A10": "walking_on_treadmill_flat",
     "A11": "walking_on_treadmill_inclined",
     "A12": "running_on_treadmill",
@@ -73,16 +73,16 @@ _LAYOUT = {
     "file_extension": ".txt",
 }
 
+_ACTIVITY_DIR_RE = re.compile(_LAYOUT["activity_dir_pattern"])
+_SUBJECT_DIR_RE = re.compile(_LAYOUT["subject_dir_pattern"])
+_SEGMENT_FILE_RE = re.compile(_LAYOUT["segment_file_pattern"])
+_ACTIVITY_CODE_RE = re.compile(_LAYOUT["code_regex_pattern"])
+
 DSA_TABLE_NAME = "segments"
 
 
 class DSADataset(BaseDataset):
     """Daily and Sports Activities (DSA) time-series dataset (Barshan & Altun, 2010).
-
-    Structure mirrors :class:`SleepEDFDataset`: YAML lists only the manifest table;
-    labels, layout regexes, and channel metadata are defined in this module. If
-    ``dsa-pyhealth.csv`` is missing under ``root``, the tree is scanned and the
-    manifest is written before :class:`BaseDataset` is initialized.
 
     Recordings use five on-body IMU units (torso, two arms, two legs); each unit
     contributes nine columns per row (3-axis accelerometer, gyroscope, and
@@ -152,51 +152,34 @@ class DSADataset(BaseDataset):
         self._num_columns: int = _NUM_COLUMNS
         self._num_rows: int = _NUM_ROWS
 
-        layout = _LAYOUT
-        self._activity_dir_pattern = re.compile(layout["activity_dir_pattern"])
-        self._subject_dir_pattern = re.compile(layout["subject_dir_pattern"])
-        self._segment_file_pattern = re.compile(layout["segment_file_pattern"])
-        self._code_regex_pattern = layout["code_regex_pattern"]
-        self._file_extension = layout["file_extension"]
-
-    def _manifest_path(self) -> str:
-        table_cfg = self.config.tables[DSA_TABLE_NAME]
-        return os.path.join(self.root, table_cfg.file_path)
-
-    def _get_label_mapping(self) -> Dict[str, str]:
-        return dict(self.label_mapping)
+        self._manifest_df: pd.DataFrame = pd.read_csv(os.path.join(self.root, self.config.tables[DSA_TABLE_NAME].file_path))
 
     def prepare_metadata(self, root: str) -> None:
         """Scan ``root`` and write ``dsa-pyhealth.csv`` (``tables.segments``)."""
-        layout = _LAYOUT
-        a_re = re.compile(layout["activity_dir_pattern"])
-        p_re = re.compile(layout["subject_dir_pattern"])
-        s_re = re.compile(layout["segment_file_pattern"])
-
         rows = []
         for a_dir in sorted(os.listdir(root)):
-            if not a_re.match(a_dir):
+            if not _ACTIVITY_DIR_RE.match(a_dir):
                 continue
-            activity_code = f"A{int(a_dir[1:])}"
+            activity_code = a_dir.upper()
             a_path = os.path.join(root, a_dir)
             if not os.path.isdir(a_path):
                 continue
 
             for p_dir in sorted(os.listdir(a_path)):
-                if not p_re.match(p_dir):
+                if not _SUBJECT_DIR_RE.match(p_dir):
                     continue
                 p_path = os.path.join(a_path, p_dir)
                 if not os.path.isdir(p_path):
                     continue
 
                 for s_file in sorted(os.listdir(p_path)):
-                    if not s_re.match(s_file):
+                    if not _SEGMENT_FILE_RE.match(s_file):
                         continue
 
                     rows.append(
                         {
                             "subject_id": p_dir,
-                            "activity_name": _LABEL_MAPPING.get(activity_code, ""),
+                            "activity_name": _LABEL_MAPPING[activity_code],
                             "activity_code": activity_code,
                             "segment_path": f"{a_dir}/{p_dir}/{s_file}",
                         }
@@ -214,26 +197,16 @@ class DSADataset(BaseDataset):
 
     def get_subject_ids(self) -> List[str]:
         """Return sorted subject IDs from the manifest."""
-        df = pd.read_csv(self._manifest_path())
-        return sorted(df["subject_id"].unique().tolist())
+        return sorted(self._manifest_df["subject_id"].unique().tolist())
 
     def get_activity_labels(self) -> Dict[str, int]:
         """Map activity name to class index (ordered by activity code)."""
-        code_re = re.compile(self._code_regex_pattern)
-        def _code_order(code: str) -> int:
-            match = code_re.match(code)
-            if match is None:
-                raise ValueError(f"Invalid activity code {code!r}")
-            return int(match.group(1))
-
-        codes = sorted(self.label_mapping.keys(), key=_code_order)
+        codes = sorted(self.label_mapping.keys())
         return {self.label_mapping[c]: i for i, c in enumerate(codes)}
 
     def get_subject_data(self, subject_id: str) -> Dict[str, Any]:
         """Load all segment arrays for one subject."""
-        df = pd.read_csv(self._manifest_path())
-
-        subject_df = df[df["subject_id"] == subject_id]
+        subject_df = self._manifest_df[self._manifest_df["subject_id"] == subject_id]
         if subject_df.empty:
             raise ValueError(f"Subject {subject_id!r} not found in manifest")
 
@@ -292,7 +265,5 @@ class DSADataset(BaseDataset):
             "data": data,
             "num_samples": n_rows,
             "sampling_rate": self.sampling_frequency,
-            "units": self.units,
-            "sensors": self.sensors,
             "segment_filename": os.path.basename(file_path),
         }

@@ -37,9 +37,7 @@ SEGMENT_RECORD_KEYS = frozenset(
         "num_samples",
         "sampling_rate",
         "segment_filename",
-        "sensors",
         "subject_id",
-        "units",
     }
 )
 
@@ -183,7 +181,7 @@ class TestDSADataset(unittest.TestCase):
         row = df.iloc[0]
         self.assertEqual(row["subject_id"], "p1")
         self.assertEqual(row["activity_name"], "sitting")
-        self.assertEqual(row["activity_code"], "A1")
+        self.assertEqual(row["activity_code"], "A01")
         self.assertEqual(row["segment_path"], "a01/p1/s01.txt")
 
     def test_load_table_manifest_via_base_dataset(self):
@@ -194,7 +192,7 @@ class TestDSADataset(unittest.TestCase):
         self.assertEqual(row["patient_id"], "p1")
         self.assertEqual(row["event_type"], "segments")
         self.assertEqual(row["segments/activity_name"], "sitting")
-        self.assertEqual(row["segments/activity_code"], "A1")
+        self.assertEqual(row["segments/activity_code"], "A01")
         self.assertEqual(row["segments/segment_path"], "a01/p1/s01.txt")
         self.assertTrue(pd.isna(row["timestamp"]))
 
@@ -245,8 +243,8 @@ class TestDSADataset(unittest.TestCase):
             # Check activity names are mapped correctly
             self.assertIn("sitting", df["activity_name"].values)
             self.assertIn("standing", df["activity_name"].values)
-            self.assertIn("A1", df["activity_code"].values)
-            self.assertIn("A2", df["activity_code"].values)
+            self.assertIn("A01", df["activity_code"].values)
+            self.assertIn("A02", df["activity_code"].values)
 
     def test_subject_not_found_raises(self):
         """Requesting data for a non-existent subject raises ValueError."""
@@ -283,7 +281,7 @@ class TestDSADataset(unittest.TestCase):
             self.assertEqual(len(df), 1)
             row = df.iloc[0]
             self.assertEqual(row["subject_id"], "p5")
-            self.assertEqual(row["activity_code"], "A3")
+            self.assertEqual(row["activity_code"], "A03")
             self.assertEqual(row["activity_name"], "lying_on_back")
 
 

@@ -8,8 +8,61 @@ import torch.nn.functional as F
 
 from pyhealth.datasets import SampleDataset
 from pyhealth.models import BaseModel
+from pyhealth.models.ipd_dtw_kde import (
+    batched_paired_dtw_distances,
+    kde_smoothed_scalar,
+)
 
 DistanceFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+class _CallableBackbone(nn.Module):
+    """Wraps a stateless callable ``fn(x) -> Tensor`` as an ``nn.Module``."""
+
+    def __init__(
+        self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        output_dim: int,
+    ) -> None:
+        super().__init__()
+        self.fn = fn
+        self.output_dim = int(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return self.fn(x)
+
+
+class _PaperDSAFCNBackbone(nn.Module):
+    """1D CNN + GAP, aligned with the reference ``build_fcn`` (Keras) stack."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        conv_channels: int = 128,
+        kernel_size: int = 7,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.output_dim = conv_channels
+        self.bn = nn.BatchNorm1d(in_channels)
+        pad = kernel_size // 2
+        self.conv = nn.Conv1d(
+            in_channels,
+            conv_channels,
+            kernel_size=kernel_size,
+            padding=pad,
+        )
+        self.act = nn.ReLU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, T, D] -> [B, D, T]
+        x = x.transpose(1, 2)
+        x = self.bn(x)
+        x = self.conv(x)
+        x = self.act(x)
+        x = self.drop(x)
+        return x.mean(dim=-1)
 
 
 class AdaptiveTransferModel(BaseModel):
@@ -37,13 +90,25 @@ class AdaptiveTransferModel(BaseModel):
             {"lstm", "gru", "mlp"}, or a custom ``nn.Module`` can be passed.
         backbone_output_dim: Output dimension of a custom backbone. Required
             when it cannot be inferred from the module itself.
-        distance_fn: Distance function for IPD-style similarity. One of
-            {"euclidean", "manhattan", "cosine"} or a callable.
+        distance_fn: Used when ``ipd_backend="embedding"``: one of
+            {"euclidean", "manhattan", "cosine"} or a callable on embeddings.
         use_similarity_weighting: Whether to scale learning rates by similarity.
-        use_kde_smoothing: Whether to smooth pairwise distances before
-            averaging.
-        smoothing_std: Standard deviation of Gaussian smoothing noise.
+        use_kde_smoothing: If ``ipd_backend="embedding"``, adds Gaussian noise to
+            batch distances before averaging. If ``ipd_backend="dtw_kde"``,
+            fits a Gaussian KDE on paired DTW distances and averages KDE
+            samples (paper-style smooth bootstrap).
+        smoothing_std: Standard deviation of Gaussian noise (embedding IPD only).
         eps: Small constant for numerical stability.
+        input_dim: Optional per-time-step input width; inferred from the
+            dataset when omitted.
+        ipd_backend: ``"embedding"`` (encoder distances) or ``"dtw_kde"``
+            (paired multivariate DTW + optional KDE).
+        dtw_window_frac: Sakoe–Chiba band as a fraction of ``max(T1, T2)``;
+            ``None`` means unconstrained DTW.
+        kde_bandwidth: Gaussian KDE bandwidth for ``dtw_kde`` (default matches
+            the authors' reference script).
+        kde_n_draws: Number of KDE samples to average for ``dtw_kde``.
+        kde_random_state: RNG seed for KDE sampling reproducibility.
 
     Raises:
         ValueError: If the dataset does not expose exactly one label key.
@@ -62,13 +127,19 @@ class AdaptiveTransferModel(BaseModel):
         num_layers: int = 1,
         dropout: float = 0.2,
         bidirectional: bool = False,
-        backbone: Union[str, nn.Module] = "lstm",
+        backbone: Union[str, nn.Module, Callable[[torch.Tensor], torch.Tensor]] = "lstm",
         backbone_output_dim: Optional[int] = None,
         distance_fn: Union[str, DistanceFn] = "euclidean",
         use_similarity_weighting: bool = True,
         use_kde_smoothing: bool = True,
         smoothing_std: float = 0.01,
         eps: float = 1e-8,
+        input_dim: Optional[int] = None,
+        ipd_backend: str = "embedding",
+        dtw_window_frac: Optional[float] = None,
+        kde_bandwidth: float = 7.8,
+        kde_n_draws: int = 10,
+        kde_random_state: Optional[int] = None,
     ) -> None:
         """Initialize the adaptive transfer model.
 
@@ -87,10 +158,18 @@ class AdaptiveTransferModel(BaseModel):
                 IPD-style similarity.
             use_similarity_weighting: Whether adaptive learning rates should be
                 scaled by source-target similarity.
-            use_kde_smoothing: Whether to apply smoothing to pairwise
-                distances before averaging.
+            use_kde_smoothing: Embedding: jitter distances; DTW+KDE: enable KDE.
             smoothing_std: Standard deviation of the Gaussian smoothing noise.
             eps: Small constant for numerical stability.
+            input_dim: If set, per-time-step input size for built-in backbones
+                (e.g. number of DSA channels). When ``None``, the model infers
+                from ``dataset.input_info`` when present, otherwise from the
+                first training sample.
+            ipd_backend: ``embedding`` or ``dtw_kde``.
+            dtw_window_frac: Optional Sakoe–Chiba window for DTW.
+            kde_bandwidth: KDE bandwidth for ``dtw_kde``.
+            kde_n_draws: KDE Monte Carlo draws for ``dtw_kde``.
+            kde_random_state: Seed for KDE sampling.
 
         Raises:
             ValueError: If the dataset exposes more than one label key.
@@ -99,6 +178,12 @@ class AdaptiveTransferModel(BaseModel):
 
         if len(self.label_keys) != 1:
             raise ValueError("AdaptiveTransferModel supports exactly one label key.")
+
+        backend_norm = ipd_backend.lower().replace("-", "_")
+        if backend_norm not in {"embedding", "dtw_kde"}:
+            raise ValueError(
+                f"ipd_backend must be 'embedding' or 'dtw_kde', got {ipd_backend!r}."
+            )
 
         self.label_key = self.label_keys[0]
         self.feature_key = feature_key or self.feature_keys[0]
@@ -109,10 +194,19 @@ class AdaptiveTransferModel(BaseModel):
         self.use_kde_smoothing = use_kde_smoothing
         self.smoothing_std = smoothing_std
         self.eps = eps
+        self.ipd_backend = backend_norm
+        self.dtw_window_frac = dtw_window_frac
+        self.kde_bandwidth = kde_bandwidth
+        self.kde_n_draws = kde_n_draws
+        self.kde_random_state = kde_random_state
 
-        input_dim = self._infer_input_dim(self.feature_key)
+        encoder_input_dim = (
+            max(1, int(input_dim))
+            if input_dim is not None
+            else self._infer_input_dim(self.feature_key)
+        )
         self.encoder, encoder_output_dim = self._build_encoder(
-            input_dim=input_dim,
+            input_dim=encoder_input_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout,
@@ -132,15 +226,39 @@ class AdaptiveTransferModel(BaseModel):
         num_layers: int,
         dropout: float,
         bidirectional: bool,
-        backbone: Union[str, nn.Module],
+        backbone: Union[str, nn.Module, Callable[[torch.Tensor], torch.Tensor]],
         backbone_output_dim: Optional[int],
     ) -> Tuple[nn.Module, int]:
         """Build the encoder and infer its output size."""
         if isinstance(backbone, nn.Module):
+            if isinstance(backbone, nn.LSTM) and backbone.input_size != input_dim:
+                raise ValueError(
+                    f"LSTM input_size={backbone.input_size} does not match "
+                    f"dataset feature width {input_dim}."
+                )
+            if isinstance(backbone, nn.GRU) and backbone.input_size != input_dim:
+                raise ValueError(
+                    f"GRU input_size={backbone.input_size} does not match "
+                    f"dataset feature width {input_dim}."
+                )
             output_dim = self._infer_backbone_output_dim(
                 backbone, backbone_output_dim
             )
             return backbone, output_dim
+
+        if callable(backbone) and not isinstance(backbone, type):
+            if backbone_output_dim is None:
+                raise ValueError(
+                    "backbone_output_dim is required when backbone is a callable."
+                )
+            enc = _CallableBackbone(backbone, backbone_output_dim)
+            return enc, backbone_output_dim
+
+        if not isinstance(backbone, str):
+            raise ValueError(
+                f"Unsupported backbone type: {type(backbone)}. "
+                "Expected str, nn.Module, or a callable tensor->tensor."
+            )
 
         backbone_name = backbone.lower()
 
@@ -177,9 +295,18 @@ class AdaptiveTransferModel(BaseModel):
             )
             return encoder, hidden_dim
 
+        if backbone_name == "fcn":
+            encoder = _PaperDSAFCNBackbone(
+                in_channels=input_dim,
+                conv_channels=128,
+                kernel_size=7,
+                dropout=dropout,
+            )
+            return encoder, encoder.output_dim
+
         raise ValueError(
             f"Unsupported backbone: {backbone}. Expected one of "
-            "{'lstm', 'gru', 'mlp'} or a custom backbone module."
+            "{'lstm', 'gru', 'mlp', 'fcn'} or a custom backbone module."
         )
 
     def _infer_backbone_output_dim(
@@ -188,14 +315,24 @@ class AdaptiveTransferModel(BaseModel):
         backbone_output_dim: Optional[int],
     ) -> int:
         """Infer output size for a custom backbone."""
-        if backbone_output_dim is not None:
-            return backbone_output_dim
-
+        inferred: Optional[int] = None
         for attr in ["output_dim", "hidden_dim", "hidden_size", "embedding_dim"]:
             if hasattr(backbone, attr):
                 value = getattr(backbone, attr)
                 if isinstance(value, int) and value > 0:
-                    return value
+                    inferred = value
+                    break
+
+        if backbone_output_dim is not None:
+            if inferred is not None and inferred != backbone_output_dim:
+                raise ValueError(
+                    f"backbone_output_dim={backbone_output_dim} conflicts with "
+                    f"inferred output size {inferred} from the backbone module."
+                )
+            return backbone_output_dim
+
+        if inferred is not None:
+            return inferred
 
         raise ValueError(
             "Could not infer backbone output dimension. Please provide "
@@ -217,6 +354,10 @@ class AdaptiveTransferModel(BaseModel):
             return lambda x, y: torch.norm(x - y, p=1, dim=1)
         if name == "cosine":
             return lambda x, y: 1.0 - F.cosine_similarity(x, y, dim=1)
+        if name in {"dtw_kde", "dtw"}:
+            raise ValueError(
+                "distance_fn='dtw_kde' is invalid; set ipd_backend='dtw_kde' instead."
+            )
 
         raise ValueError(
             f"Unsupported distance_fn: {distance_fn}. Expected one of "
@@ -224,17 +365,42 @@ class AdaptiveTransferModel(BaseModel):
         )
 
     def _infer_input_dim(self, feature_key: str) -> int:
-        """Infer dense feature dimensionality from dataset metadata."""
+        """Infer per-time-step feature width from metadata or one sample."""
         if self.dataset is None:
             return 1
 
+        info = getattr(self.dataset, "input_info", None)
+        if isinstance(info, dict) and feature_key in info:
+            try:
+                stats = info[feature_key]
+                if isinstance(stats, dict):
+                    if "len" in stats and isinstance(stats["len"], int):
+                        return max(1, int(stats["len"]))
+                    if "dim" in stats and isinstance(stats["dim"], int):
+                        return max(1, int(stats["dim"]))
+            except (KeyError, TypeError):
+                pass
+
         try:
-            stats = self.dataset.input_info[feature_key]
-            if "len" in stats and isinstance(stats["len"], int):
-                return max(1, int(stats["len"]))
-            if "dim" in stats and isinstance(stats["dim"], int):
-                return max(1, int(stats["dim"]))
-        except (KeyError, TypeError, AttributeError):
+            if len(self.dataset) == 0:
+                return 1
+            sample = self.dataset[0]
+            if feature_key not in sample:
+                return 1
+            feat = sample[feature_key]
+            if isinstance(feat, torch.Tensor):
+                if feat.dim() >= 2:
+                    return max(1, int(feat.shape[-1]))
+                return 1
+            if isinstance(feat, (list, tuple)):
+                proc = self.dataset.input_processors.get(feature_key)
+                if proc is not None:
+                    schema = proc.schema()
+                    if "value" in schema:
+                        t = feat[schema.index("value")]
+                        if isinstance(t, torch.Tensor) and t.dim() >= 2:
+                            return max(1, int(t.shape[-1]))
+        except Exception:
             pass
 
         return 1
@@ -445,6 +611,9 @@ class AdaptiveTransferModel(BaseModel):
         Raises:
             ValueError: If the source and target batch sizes differ.
         """
+        if self.ipd_backend == "dtw_kde":
+            return self._compute_paired_dtw_distances(source_batch, target_batch)
+
         source_emb = self.extract_embedding(source_batch)
         target_emb = self.extract_embedding(target_batch)
 
@@ -455,6 +624,24 @@ class AdaptiveTransferModel(BaseModel):
             )
 
         return self.distance_fn(source_emb, target_emb)
+
+    @torch.no_grad()
+    def _compute_paired_dtw_distances(
+        self,
+        source_batch: Dict[str, Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
+        target_batch: Dict[str, Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
+    ) -> torch.Tensor:
+        src_val, _ = self._get_feature_value_and_mask(source_batch[self.feature_key])
+        tgt_val, _ = self._get_feature_value_and_mask(target_batch[self.feature_key])
+        if src_val.shape[0] != tgt_val.shape[0]:
+            raise ValueError(
+                "Source and target batches must have the same batch size "
+                "for paired DTW IPD."
+            )
+        x = src_val.detach().cpu().float().numpy()
+        y = tgt_val.detach().cpu().float().numpy()
+        dists = batched_paired_dtw_distances(x, y, window_frac=self.dtw_window_frac)
+        return torch.as_tensor(dists, device=self.device, dtype=torch.float32)
 
     @torch.no_grad()
     def compute_ipd(
@@ -469,8 +656,19 @@ class AdaptiveTransferModel(BaseModel):
             target_batch: Target-domain batch dictionary.
 
         Returns:
-            Mean paired distance as a float.
+            Scalar IPD summary for this batch (mean distance, or KDE smooth).
         """
+        if self.ipd_backend == "dtw_kde":
+            distances = self._compute_paired_dtw_distances(source_batch, target_batch)
+            if self.use_kde_smoothing:
+                return kde_smoothed_scalar(
+                    distances.detach().cpu().float().numpy(),
+                    bandwidth=self.kde_bandwidth,
+                    n_draws=self.kde_n_draws,
+                    random_state=self.kde_random_state,
+                )
+            return float(torch.clamp(distances.mean(), min=0.0).item())
+
         distances = self.compute_pairwise_distances(source_batch, target_batch)
 
         if self.use_kde_smoothing:

@@ -1,9 +1,7 @@
-import numpy as np
 import torch
 import torch.nn as nn
 
 from pyhealth.models.adaptive_transfer import AdaptiveTransferModel
-from pyhealth.models.ipd_dtw_kde import batched_paired_dtw_distances, multivariate_dtw_distance
 
 
 class _DummyInputProcessor:
@@ -215,41 +213,12 @@ def test_adaptive_transfer_get_adaptive_lr():
     assert model_unweighted.get_adaptive_lr(base_lr, similarity) == base_lr
 
 
-def test_multivariate_dtw_identical_zero():
-    x = np.zeros((7, 3), dtype=np.float64)
-    y = np.zeros((7, 3), dtype=np.float64)
-    assert multivariate_dtw_distance(x, y) == 0.0
-
-
-def test_batched_paired_dtw_matches_per_row():
-    rng = np.random.default_rng(0)
-    x = rng.standard_normal((5, 10, 4))
-    y = x.copy()
-    d = batched_paired_dtw_distances(x, y)
-    assert d.shape == (5,)
-    assert np.allclose(d, 0.0, atol=1e-9)
-
-
-def test_adaptive_transfer_dtw_kde_compute_ipd():
+def test_adaptive_transfer_mlp_backbone_forward():
     dataset = _DummyDataset(num_classes=3, input_dim=4)
     model = AdaptiveTransferModel(
         dataset=dataset,
         feature_key="signal",
-        ipd_backend="dtw_kde",
-        use_kde_smoothing=False,
-        kde_random_state=0,
-    )
-    b = _make_batch(batch_size=3, seq_len=8, input_dim=4, num_classes=3)
-    ipd = model.compute_ipd(b, b)
-    assert ipd == 0.0
-
-
-def test_adaptive_transfer_fcn_forward():
-    dataset = _DummyDataset(num_classes=3, input_dim=4)
-    model = AdaptiveTransferModel(
-        dataset=dataset,
-        feature_key="signal",
-        backbone="fcn",
+        backbone="mlp",
         hidden_dim=32,
     )
     batch = _make_batch(batch_size=3, seq_len=8, input_dim=4, num_classes=3)

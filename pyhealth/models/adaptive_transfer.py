@@ -236,7 +236,7 @@ class AdaptiveTransferModel(BaseModel):
         )
 
     def _infer_input_dim(self, feature_key: str) -> int:
-        """Infer dense feature dimensionality from dataset metadata."""
+        """Infer per-time-step width from ``input_info`` or the first sample."""
         if self.dataset is None:
             return 1
 
@@ -247,6 +247,26 @@ class AdaptiveTransferModel(BaseModel):
             if "dim" in stats and isinstance(stats["dim"], int):
                 return max(1, int(stats["dim"]))
         except (KeyError, TypeError, AttributeError):
+            pass
+
+        try:
+            n = len(self.dataset)
+            if n == 0 or feature_key not in self.dataset[0]:
+                return 1
+            feature = self.dataset[0][feature_key]
+            if isinstance(feature, torch.Tensor):
+                value = feature
+            else:
+                proc = self.dataset.input_processors[feature_key]
+                schema = proc.schema()
+                if "value" not in schema:
+                    return 1
+                value = feature[schema.index("value")]
+            if value.dim() == 1:
+                return 1
+            if value.dim() >= 2:
+                return max(1, int(value.shape[-1]))
+        except Exception:
             pass
 
         return 1
